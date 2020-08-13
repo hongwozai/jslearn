@@ -1,0 +1,169 @@
+#+TITLE: QuickJS源码阅读 对象模型与垃圾回收
+
+* 垃圾回收
+
+在这里我们首先来看看QuickJS的垃圾回收，为什么把垃圾回收放在第一个地方来讲呢？因为垃圾回收与QuickJS的对象模型息息相关，是整个JS引擎的基石之一。一般来说，对解释器或编译器的原理的相关解析都是从词法分析开始，但是对于QuickJS这种动态类型语言实现，会在词法分析阶段就生成后面阶段使用的常量对象。所以这里把垃圾回收放在源码最开始进行讲解。
+
+当然，如果你对垃圾回收不感兴趣，并且了解引用计数基本运作原理，那么绕过去看之后的内容问题也不大。
+
+** 低层的内存分配器
+
+QuickJS设计的目标之一就是嵌入式的场景，跨平台、内存占用、甚至用户自定义分配器等都是需要考虑的因素。QuickJS选择了将最低层的内存分配交给外部用户来进行定义。
+
+#+BEGIN_SRC c
+typedef struct JSMallocFunctions {
+    void *(*js_malloc)(JSMallocState *s, size_t size);
+    void (*js_free)(JSMallocState *s, void *ptr);
+    void *(*js_realloc)(JSMallocState *s, void *ptr, size_t size);
+    size_t (*js_malloc_usable_size)(const void *ptr);
+} JSMallocFunctions;
+
+typedef struct JSMallocState {
+    size_t malloc_count;
+    size_t malloc_size;
+    size_t malloc_limit;
+    void *opaque; /* user opaque */
+} JSMallocState;
+
+  /* JSRuntime是QuickJS的终极管理结构，这里先忽视，后文有详细讲解 */
+  struct JSRuntime {
+      JSMallocFunctions mf;
+      JSMallocState malloc_state;
+  };
+#+END_SRC
+
+可以看到这个低层的内存分配接口同C语言标准库的malloc提供的类似，只是多了一个可以由外部传入的JSMallocState，方便嵌入场景下用户自定义内存分配器。
+
+同时QuickJS也提供了一个默认的内存分配器，这个默认的分配器也仅仅是标准malloc的一层封装，十分简单，这里不在讲述。
+
+** 引用计数
+
+最低层的分配器我们已经知道了，接下来就是垃圾回收算法的天下了。垃圾回收的算法繁多，java的分代垃圾回收更是出名，但这里我们不做各种算法学术上的讨论，只聚焦于QuickJS具体的实现。
+
+QuickJS官方的介绍中就由说明使用的垃圾回收策略：引用计数。引用计数的一大好处就是少有停顿时间，因为内存的回收的时间一般是分散的，基本不会像其他算法那样停顿较长时间。
+
+#+BEGIN_QUOTE
+不过现在据我所知，现代据有垃圾回收的语言中少有选择引用计数方式的垃圾回收算法的，唯一一个知名的就是CPython(C语言实现的那一版Python，也是现在使用最广泛的实现)。
+引用计数也有很多坏处，例如无法解决内存碎片问题，而且每次变更指针都要更新对应计数，吞吐量低（需要处理的堆大小除以GC占用时间，为吞吐量）。
+#+END_QUOTE
+
+引用计数的基本实现很简单，就是在有指针指向的时候引用计数+1，在指针更改的时候引用计数-1。但QuickJS是怎么做的呢？
+
+首先定义了一个结构体，里面是用于引用计数的成员ref_count。
+
+#+BEGIN_SRC c
+typedef struct JSRefCountHeader {
+    int ref_count;
+} JSRefCountHeader;
+#+END_SRC
+
+然后在每一个需要引用计数管理的对象头部中定义了一个成员。这里截取了其中三个结构体作为展示。
+
+#+BEGIN_SRC c
+  /* 字符串对象 */
+  struct JSString {
+      JSRefCountHeader header; /* must come first, 32-bit */
+      /* <=========== 其他成员暂时忽略 ===========> */
+  };
+  /* 每一个JS环境上下文 */
+  struct JSContext {
+      JSGCObjectHeader header; /* must come first */
+      /* <=========== 其他成员暂时忽略 ===========> */
+  };
+  /* 用于处理可能循环引用的结构体 */
+  struct JSGCObjectHeader {
+      int ref_count; /* must come first, 32-bit */
+      /* <=========== 其他成员暂时忽略 ===========> */
+  };
+#+END_SRC
+
+对于C语言不是很熟的同学们是不是有些奇怪？为什么注释中会写JSRefCountHeader必须放在第一个位置上呢？而这个JSGCObjectHeader没有ref的结构体，而是直接定义了一个ref_count，并且也必须放在第一个？这是一种常见的C语言手法：利用两者在内存中的位置一致，使用强转来模拟继承的一种方法。使用的时候就可以达成这样一种效果：
+
+#+BEGIN_SRC c
+/* 非QuickJS代码，仅模拟 */
+void DelRef(JSRefCountHeader *h) {
+    h->ref_count --;
+    if (h->ref_count == 0) {
+        /* 释放等操作... */
+    }
+}
+
+JSContext context;
+DelRef((JSRefCountHeader*)&context);
+
+JSString string;
+DelRef((JsRefCountHeader*)&string);
+#+END_SRC
+
+可以看到这里QuickJS对引用计数的使用也是很简单的，仅仅要求其头部放在第一位来方便管理。不过c语言不像c++可以重载赋值操作符，需要自行维护引用计数的增减，所以开发人员也许要一颗记忆力好的大脑:)。要是忘记一处，那可就有的调试了。
+
+引用计数的理念非常简单，但是它还有致命的问题，循环引用!
+
+** 循环引用？No!
+
+#+BEGIN_QUOTE
+有一天，一个学生来见Moon教授，并对他说：“我知道如何构造一个更好的垃圾收集器。我们必须保存指向每个结构的指针的引用计数。”
+Moon教授耐心地给学生讲了下面地故事：
+“有一天，一个学生来见Moon教授，并对他说：‘我知道如何构造一个更好的垃圾收集器……’”
+#+END_QUOTE
+
+我们现在就来看看QuickJS是如何解决循环引用问题的（大概这部分内容才是最值得期待地吧）。
+
+*** 循环引用是怎么产生的
+#+BEGIN_SRC javascript
+let f1 = () => {
+    let obj1 = {}
+    let obj2 = {test: obj1}
+    obj1.obj2 = obj2;
+    return;
+}
+f1();
+#+END_SRC
+
+*** 解决的原理
+释放对象的时候
+1. 放入gc_zero_ref_count_list
+
+启动回收器的时候
+1. 解引用
+2. 扫描非0引用和其child
+3. 释放循环引用
+
+#+BEGIN_SRC c
+void JS_RunGC(JSRuntime *rt)
+{
+    /* decrement the reference of the children of each object. mark =
+       1 after this pass. */
+    gc_decref(rt);
+
+    /* keep the GC objects with a non zero refcount and their childs */
+    gc_scan(rt);
+
+    /* free the GC objects in a cycle */
+    gc_free_cycles(rt);
+}
+#+END_SRC
+
+#+BEGIN_SRC c
+typedef enum {
+    JS_GC_PHASE_NONE,
+    JS_GC_PHASE_DECREF,
+    JS_GC_PHASE_REMOVE_CYCLES,
+} JSGCPhaseEnum;
+#+END_SRC
+
+#+BEGIN_SRC c
+struct JSGCObjectHeader {
+    int ref_count; /* must come first, 32-bit */
+    JSGCObjectTypeEnum gc_obj_type : 4;
+    uint8_t mark : 4; /* used by the GC */
+    uint8_t dummy1; /* not used by the GC */
+    uint16_t dummy2; /* not used by the GC */
+    struct list_head link;
+};
+#+END_SRC
+
+*** 触发时机
+
+
+* 对象模型

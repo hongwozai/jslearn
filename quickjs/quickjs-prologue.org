@@ -1,0 +1,16 @@
+#+TITLE: QuickJS源码阅读 序
+
+* 为什么选择QuickJS
+然后我就想，我对JavaScript并不熟悉，但是我学过编译原理啊，看个JS解释器不就行了吗:)。
+
+主要目的一个当然是学习JS了:)，当然还有学习（shui wen zhang）。
+
+谷歌一搜索网上已经有些热度了：
+
+QuickJS的学习资料：
+b站：
+博客：
+
+* QuickJS介绍
+
+相比与其他相对toy的实现，QuickJS对ES6的完成度相当高。
