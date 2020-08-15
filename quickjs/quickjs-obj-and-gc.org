@@ -219,7 +219,7 @@ void JS_RunGC(JSRuntime *rt)
 }
 #+END_SRC
 
-其中的gc_decref函数如下。其中的mark_children在这里无需深究，它就是根据类型的不同来调用gc_decref_child函数来对所有的引用对象减少引用计数。
+其中的gc_decref函数如下。其中的mark_children在这里无需深究，它就是根据类型的不同来调用gc_decref_child函数对所有的子节点减少引用计数。
 
 #+BEGIN_SRC c
   static void gc_decref(JSRuntime *rt)
