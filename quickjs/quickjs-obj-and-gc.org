@@ -1,4 +1,4 @@
-#+TITLE: QuickJS源码阅读 对象模型与垃圾回收
+#+TITLE: QuickJS源码阅读 引用计数与垃圾回收
 
 * 垃圾回收
 
@@ -6,7 +6,7 @@
 
 当然，如果你对垃圾回收不感兴趣，并且了解引用计数基本运作原理，那么绕过去看之后的内容问题也不大。
 
-需要指出的是，对象这个名词在本文中指代的是gc分配出来的东西，而非是js概念中具有属性的对象，前者的表达范围要超过后者。
+需要指出的是，对象这个名词在本文中指代的是gc分配出来的东西，而非是js概念中具有属性的对象，前者的表达范围要超过后者。后者我们在本文中称做js对象。
 
 ** 低层的内存分配器
 
@@ -79,22 +79,23 @@ typedef struct JSRefCountHeader {
   };
 #+END_SRC
 
-对于C语言不是很熟的同学们是不是有些奇怪？为什么注释中会写JSRefCountHeader必须放在第一个位置上呢？而这个JSGCObjectHeader没有ref的结构体，而是直接定义了一个ref_count，并且也必须放在第一个？这是一种常见的C语言手法：利用两者在内存中的位置一致，使用强转来模拟继承的一种方法。使用的时候就可以达成这样一种效果：
+对于C语言不是很熟的同学们是不是有些奇怪？为什么注释中会写JSRefCountHeader必须放在第一个位置上呢？而展示的代码中JSGCObjectHeader这个结构体没有ref的结构体，而是直接定义了一个ref_count，并且也必须放在第一个？这是一种常见的C语言手法：利用两者在内存中的位置一致，使用强转来模拟继承的一种方法。使用的时候就可以达成这样一种效果：
 
 #+BEGIN_SRC c
-/* 非QuickJS代码，仅模拟 */
-void DelRef(JSRefCountHeader *h) {
-    h->ref_count --;
-    if (h->ref_count == 0) {
-        /* 释放等操作... */
-    }
-}
+  /* 非QuickJS代码，仅模拟 */
+  void DelRef(JSRefCountHeader *h) {
+      h->ref_count --;
+      if (h->ref_count == 0) {
+          /* 释放等操作... */
+      }
+  }
 
-JSContext context;
-DelRef((JSRefCountHeader*)&context);
+  /* 两种不同的类型，同样的操作 */
+  JSContext context;
+  DelRef((JSRefCountHeader*)&context);
 
-JSString string;
-DelRef((JsRefCountHeader*)&string);
+  JSString string;
+  DelRef((JsRefCountHeader*)&string);
 #+END_SRC
 
 可以看到这里QuickJS对引用计数的使用也是很简单的，仅仅要求其头部放在第一位来方便管理。不过c语言不像c++可以重载赋值操作符，需要自行维护引用计数的增减，所以开发人员也许要一颗记忆力好的大脑:)。要是忘记一处，那可就有的调试了。
@@ -113,7 +114,7 @@ Moon教授耐心地给学生讲了下面地故事：
 
 *** 循环引用是怎么产生的
 
-我们先来构造一个例子：
+我们先来构造一个循环引用的例子：
 
 #+BEGIN_SRC javascript
 let f1 = () => {
@@ -127,36 +128,81 @@ f1();
 
 在上例中，f1函数调用时会生成两个对象obj1和obj2，这俩个对象的next属性分别指向对方。当函数结束时，这两个对象应该都会进行引用计数的减1。但同时，两个对象还互相留有指针，导致实际上的内存在函数结束时没有立刻释放。
 
-函数运行时图 －》 函数运行完毕的图
+[[file:gc/function_cycles_ref.png]]
 
 这时这两个对象已经脱离了内存的管控（因为已经没有任何指针引用），我们无法回收。
 
 *** 解决的原理
 
-为了能够在出现循环引用时还能访问到这两个对象， QuickJS在创建这些具有指向其他对象能力的对象时(QuickJS中一共6种)，就会将这些对象加入一个叫gc_obj_list的链表中。这样实际上，这些内存永远没有脱离管控，只是还没有处理循环引用。
+**** 解引用deref
+为了能够在出现循环引用时还能访问到这两个对象， QuickJS在创建这些具有指向其他对象能力的对象时(QuickJS中一共6种)，就会将这些对象加入一个叫gc_obj_list的链表中，这个链表是用来串联所有的gc对象，并不会增减引用计数。加入gc链表之后，实际上所有的这些内存永远也无法脱离管控，只是我们无法区分正常引用与循环引用。下图中绿色箭头表示gc_obj_list。
 
-链表添加后的图形
+[[file:gc/gc_obj_list.png][gc_obj_list管理时]]
 
-链表有了然后怎么办呢，要如何打破这个环呢？
+指向全部gc对象的链表有了，然后怎么办呢，要如何找到这个环呢？一般而言，这样一个环必须从外部进行打破，QuickJS的做法第1步就是通过减少引用计数来解开引用环，并将引用计数为0的结点加入另一个链表中tmp_obj_list。这里的引用计数减少并不会进行内存的释放，也不会对引用关系进行修改，只是单纯的修改引用计数。下面我们来看看具体的例子。
 
+***** 循环引用的例子
+为了更好说明，我们在之前有环的例子中增加一个结点，下图是在开始gc之前的状态：
 
+[[file:gc/defref1.png]]
 
-生成gc对象的时候
-1. context
-2. shape
-3. jsobject
-4. varref
-5. async_function
-6. function_bytecode
+然后开始从gc_obj_list开头进行遍历，减少每个子结点的引用计数。注意这里不能够减少自己的引用计数，必须跟着实际的引用关系来走。为了标识是否已经遍历，这里还增加了一个标记位。
 
-启动回收器的时候
-1. 解引用，对gc_obj_list中的引用计数减1
-2. 扫描非0引用和其child
-3. 释放循环引用
+[[file:gc/deref2.png]]
 
+上图中，开始遍历gc_obj_list，遍历第一个对象时，将其所引用的第二个对象的引用计数减1。此时第二个对象的引用计数变为0，不过此时QuickJS在这里没有选择将第二个对象加入tmp_obj_list，而是遍历到第二个对象时才把自己加入tmp链表。
+
+[[file:gc/defref3.png]]
+
+接下来遍历第二个对象时，首先同样会将所引用的对象引用计数-1。其次判断到自己已经引用计数为0，那么将自己从gc_obj_list拿出，并加入tmp_obj_list。
+
+[[file:gc/defref4.png]]
+
+当开始遍历第三个对象时，同样的引用计数-1，不过这时会发现第一个对象是已经遍历过的（同时引用计数为0），这时也会将第一个对象放入tmp_obj_list。当然，第三个对象自身的引用计数也在之前减去，所以第三个对象自己也会加入tmp_obj_list。
+
+至此，所有引用计数为0的结点都已经加入tmp_obj_list。
+
+***** 正常无循环引用的例子
+
+为了更好的认识这一过程，我加入了无环情况下的例子。
+
+[[file:gc/noring_deref1.png]]
+   
+上图是无环情况下的一个简单例子，图中的标注的根节点根据情况可能是上下文环境、可能是某个不释放的特殊对象、甚至也可能会在gc_obj_list中，但是为了不影响我们对解引用过程的描述，我画图时将其放在gc_obj_list外部。
+
+这个时候，所有的对象引用计数都是1，但从图中可以看出，并没有循环引用。
+
+[[file:gc/noring_deref2.png]]
+
+遍历第一个对象时，情况与有循环时相同。
+
+[[file:gc/noring-deref3.png]]
+
+遍历第二个对象时，情况有所不同。第二个对象自身的引用计数为0，所以将其自身加入tmp_obj_list中。而第一个对象还一如往常，没有变化（因为这个例子中没有循环的指针了）。
+
+可以看到，引用计数为0的对象加入了tmp_obj_list中，而引用计数大于0的对象还留在tmp_obj_list中。
+
+**** 扫描 scan
+
+可能有的同学会问，这样的操作在无环的时候，也会把一些并非是循环引用的对象加入tmp_obj_list，这结果对吗？对。tmp_obj_list中包括了所有引用计数为0的结点，并非只包含循环引用的结点，这也是它名字中"临时"的由来。不仅如此，之前的解引用操作会将那些只有一个引用但是正在使用的对象放入tmp_obj_list。
+
+但是仔细想一想，我们进行了解引用之后，这个tmp链表一定是包括了所有循环引用的结点，这些结点在解引用之后是没有其他地方的对象引用，全部自给自足，只会被tmp链表中的对象所引用。而temp链表中没有参与循环引用的结点却一定还有其他对象引用，并且这个引用的对象一定在gc_obj_list中（因为gc链表保存了所有的gc对象）。那我们下一步扫描gc_obj_list，将gc链表中对象的引用计数恢复回来，不就可以将那些并不该释放的结点识别回来了吗。这也就是QuickJS回收循环引用的第2步，扫描对象并将引用计数加回来。
+
+下面为了更好的表示出第2步的过程，我们将上节两个例子合并到一起，其中的tmp_obj_list连接了两张图(因为在循环引用的例子中，gc_obj_list已经是空表)。
+
+[[file:gc/scan1.png]]
+
+扫描过程其实很简单，这时的gc链表已经是只剩下不会循环引用的对象了，只需要沿着引用关系增加引用计数即可。同时还要注意，恢复引用计数还要将该结点重新加回到gc_obj_list中。现在情况如下图。
+
+[[file:gc/scan2.png]]
+
+至此，情况已经很明朗了，gc_obj_list中放的是当前还正在使用的对象，tmp_obj_list中放的是当前已经不再使用的循环引用对象。之后的事情就很简单了，QuickJS的第3步就是将tmp_obj_list中的对象释放。
 
 *** QuickJS实现
-gc相关函数基本都是static，并以gc_开头
+
+原理说明完了，咱们再来看看QuickJS的具体实现。这部分代码还是比较简单易懂的。垃圾回收的函数入口是JS_RunGC函数。其相关函数基本都是声明为static，并以gc_开头。
+
+JS_RunGC函数如下，明明白白的三步：
 
 #+BEGIN_SRC c
 void JS_RunGC(JSRuntime *rt)
@@ -173,28 +219,101 @@ void JS_RunGC(JSRuntime *rt)
 }
 #+END_SRC
 
+其中的gc_decref函数如下。其中的mark_children在这里无需深究，它就是根据类型的不同来调用gc_decref_child函数来对所有的引用对象减少引用计数。
 
 #+BEGIN_SRC c
-typedef enum {
-    JS_GC_PHASE_NONE,
-    JS_GC_PHASE_DECREF,
-    JS_GC_PHASE_REMOVE_CYCLES,
-} JSGCPhaseEnum;
+  static void gc_decref(JSRuntime *rt)
+  {
+      struct list_head *el, *el1;
+      JSGCObjectHeader *p;
+
+      init_list_head(&rt->tmp_obj_list);
+
+      /* decrement the refcount of all the children of all the GC
+         objects and move the GC objects with zero refcount to
+         tmp_obj_list */
+      list_for_each_safe(el, el1, &rt->gc_obj_list) {
+          /* 这里的p就代表每一个gc对象 */
+          p = list_entry(el, JSGCObjectHeader, link);
+          assert(p->mark == 0);
+
+          /* 这里标记了p的所有子节点 */
+          mark_children(rt, p, gc_decref_child);
+          p->mark = 1;
+
+          /* 如果当前的结点已经引用计数为0了，那么加入到tmp_obj_list中 */
+          if (p->ref_count == 0) {
+              list_del(&p->link);
+              list_add_tail(&p->link, &rt->tmp_obj_list);
+          }
+      }
+  }
+  static void gc_decref_child(JSRuntime *rt, JSGCObjectHeader *p)
+  {
+      assert(p->ref_count > 0);
+      p->ref_count--;
+
+      /* 这里如果发现子节点引用为0,并且已经遍历过，那么加入tmp_obj_list中 */
+      if (p->ref_count == 0 && p->mark == 1) {
+          list_del(&p->link);
+          list_add_tail(&p->link, &rt->tmp_obj_list);
+      }
+  }
 #+END_SRC
 
+接下来看看扫描过程。实现中有一个需要注意的点，就是在扫描过程中，需要把遍历标记的表记位置回原本的值，以便下次扫描。
+
 #+BEGIN_SRC c
-struct JSGCObjectHeader {
-    int ref_count; /* must come first, 32-bit */
-    JSGCObjectTypeEnum gc_obj_type : 4;
-    uint8_t mark : 4; /* used by the GC */
-    uint8_t dummy1; /* not used by the GC */
-    uint16_t dummy2; /* not used by the GC */
-    struct list_head link;
-};
+static void gc_scan(JSRuntime *rt)
+{
+    struct list_head *el;
+    JSGCObjectHeader *p;
+
+    /* keep the objects with a refcount > 0 and their children. */
+    list_for_each(el, &rt->gc_obj_list) {
+        p = list_entry(el, JSGCObjectHeader, link);
+        assert(p->ref_count > 0);
+        p->mark = 0; /* 重置标记位 */
+        /* 增加引用计数时，会将之前放入tmp_obj_list的对象重新拿出 */
+        mark_children(rt, p, gc_scan_incref_child);
+    }
+    
+    /* 这里将tmp_obj_list中的对象引用计数恢复原状 */
+    list_for_each(el, &rt->tmp_obj_list) {
+        p = list_entry(el, JSGCObjectHeader, link);
+        mark_children(rt, p, gc_scan_incref_child2);
+    }
+}
+static void gc_scan_incref_child(JSRuntime *rt, JSGCObjectHeader *p)
+{
+    p->ref_count++;
+    /* 这时候发现tmp_obj_list中的对象还有用处，那么再加回gc_obj_list */
+    if (p->ref_count == 1) {
+        list_del(&p->link);
+        list_add_tail(&p->link, &rt->gc_obj_list);
+        p->mark = 0; /* 重置标记位 */
+    }
+}
+
+static void gc_scan_incref_child2(JSRuntime *rt, JSGCObjectHeader *p)
+{
+    p->ref_count++;
+}
+
 #+END_SRC
 
 *** 触发时机
-分配时
+对于引用计数来数，其特点就是没有引用了就立即释放，但是QuickJS为了解决引用计数导致循环引用问题，特意增加了一个特殊垃圾回收流程，所以QuickJS必须找到一个合适的时机来启动该流程。
 
+之前我们看到gc回收的流程函数是JS_RunGC，QuickJS同时还将是否触发gc的条件封装在了js_trigger_gc函数之内。该函数目前在申请新的js对象时调用。也就是说，排除用户退出整个Js引擎的情况，垃圾回收的触发是由创建js对象来驱动的，如果用户一直没有定义过js对象，那么QuickJS也不会启动这个垃圾回收。
 
-* 对象模型
+不过之前也提到过js_trigger_gc函数是包括是否触发gc条件。在现在的QuickJS实现里，这个是由用户进行定义的threshold来决定的，如下段代码所描述。
+
+#+BEGIN_SRC c
+    force_gc = ((rt->malloc_state.malloc_size + size) >
+                rt->malloc_gc_threshold);
+#+END_SRC
+
+** 完结
+到目前为止，QuickJS的垃圾回收处理我们已经讲完了，整体流程还是很简单的。不像V8那种分代垃圾回收，每个分代的算法不一，还各有优化点，就非常的复杂了。
+

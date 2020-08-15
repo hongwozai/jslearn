@@ -13,7 +13,7 @@ b站：
 
 * QuickJS介绍
 
-相比与其他相对toy的实现，QuickJS对ES6的完成度相当高。
+相比与其他toy的实现，QuickJS的完成度相当高。
 
 * 本文
 
