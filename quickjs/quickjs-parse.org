@@ -1,0 +1,174 @@
+#+TITLE: QuickJS源码分析 词法分析和语法分析
+
+终于来到编译原理的第一课:)。记得龙书的开篇就是n个词法分析和语法分析的算法，又是画表又是画图，直接劝退了不少编译原理的初学者。我当时就是倍感无聊，一时没有进行下去，直到后来慢慢在学习过程中才发现各种算法的用处。
+
+相对来说这两个部分虽然是实现语言时不可缺少的部分，但它机械又无趣，更有许多生成器可以代替人工，学习的时候完全可以跳过。现代编程提倡的内部DSL，其实就是在宿主语言的框架下进行解释，利用宿主语言的特性完全跳过了这两个步骤。
+
+* 词法分析
+
+废话少说，我们进入主题。按照课本来说，词法分析的目的就是从字符流中分析出单词。但现代语言，尤其是各种高级语言中，都有着字面量的存在，一些字面量会直接在这个阶段生成，且看如下代码：
+
+#+BEGIN_SRC javascript
+// 数字
+qjs> 1
+1
+// 字符串
+qjs> "123"
+"123"
+// 数组也是字面量
+qjs> [1, 2, 3]
+[ 1, 2, 3 ]
+#+END_SRC
+
+1和"123"这种简单字面量会在词法分析阶段阶段已经生成了JSValue。而像数组和对象这种复杂一些的字面量就需要留在语法分析时生成（当然视情况而定，有些语言实现会在词法分析阶段就全部生成好字面量，比如lisp）。
+
+接下来，我们看看QuickJS是如何进行词法分析的。QuickJS使用的方法叫做LL(1)，基本上大部分手写的词法分析器都是这种算法。LL(1)的理念是通过查看下一个字符来判断当前是什么类型的单词。
+
+QuickJS词法分析几乎全部流程都在next_token函数中。下面我们来看下这个函数。
+
+#+BEGIN_SRC c
+   static int next_token(JSParseState *s)
+   {
+     const uint8_t *p;
+     int c;
+       /* <======= 省略各种初始化和安检代码 ======> */
+     /* p是当前读buf的指针 */
+     p = s->last_ptr = s->buf_ptr;
+  redo:
+     /* c是当前读的字符 */
+       c = *p;
+       switch(c) {
+       case 0:
+           s->token.val = TOK_EOF;
+           break;
+       case '`': /* 处理模板 */ break;
+       case '\"': /* 处理字符串 */ break;
+       case '\n': /* 处理换行 */ break;
+           p++;
+       line_terminator:
+           s->line_num++;
+           goto redo;
+       /* <============= 省略n种case =============> */
+       case 'a' ... 'z': case 'A' ... 'Z': case '_': case '$':
+           /* 处理标识符(符号) */
+           break;
+       case '0':
+       case '1' ... '9': /* 处理数字 */ break;
+       default:
+           if (c >= 128) {
+               /* <=========== unicode处理流程 ==========> */
+           }
+       def_token:
+           s->token.val = c;
+           p++;
+           break;
+       }
+       return 0;
+
+    fail:
+       s->token.val = TOK_ERROR;
+       return -1;
+   }
+#+END_SRC
+
+很明显，这个函数就是一个大型的switch，根据每一次读取的字符的类型来决定走不同的处理流程。例如代码中出现1-9时，会进行数字的分析。
+
+#+BEGIN_SRC c
+  case '1' ... '9':
+      {
+          JSValue ret;
+
+          /* <======== 去除安检代码等 =======> */
+          ret = js_atof(s->ctx, (const char *)p, (const char **)&p, radix,
+                        flags);
+
+          /* 返回类型 */
+          s->token.val = TOK_NUMBER;
+          /* 返回值 */
+          s->token.u.num.val = ret;
+      }
+      break;
+#+END_SRC
+
+当我去除各种异常情况的代码后，这个流程就异常的清晰。就是读取当前buf的内容，解出数字的内容，生成相应字面量JSValue，再返回给调用方。不过这样的流程也说明了，以数字开头的必须是数字，否则就是错误。有些同学可能感觉这是废话，但是真的有语言不是这么做的，例如：
+
+#+BEGIN_SRC lisp
+(1+ a)
+#+END_SRC
+
+上面这段lisp代码中，以1开头的是1+这个符号，而非是数字，也不会报错。这种处理逻辑就不是简单的LL(1)可以表达的了，这时需要更多的缓存空间，查看更多的字符才能决定。
+
+一般而言，词法都是简单为主，即使LL(1)无法搞定，LL(k)也可以处理的了。这个k为常数，是开发时就可以确定的值。下面举一个例子，我们需要解析<=这个操作符时，一个字符可确定不了，因为js中还有以<为开头的操作符。只读入一个字符我们完全没办法判断当前的单词是<=还是<，又或者是左移相关操作符<<和<<=。
+
+#+BEGIN_SRC c
+  case '<':
+      if (p[1] == '=') {
+          p += 2;
+          s->token.val = TOK_LTE;
+      } else if (p[1] == '<') {
+          if (p[2] == '=') {
+              p += 3;
+              s->token.val = TOK_SHL_ASSIGN;
+          } else {
+              p += 2;
+              s->token.val = TOK_SHL;
+          }
+      } else if (s->allow_html_comments &&
+                 p[1] == '!' && p[2] == '-' && p[3] == '-') {
+          /* <===== 省略web兼容的支持 =========> */
+      } else {
+          goto def_token;
+      }
+      break;
+#+END_SRC
+
+上面的代码也很简单，走到了<的case中也要判断下一个字符是什么，是=还是<，又或是html的模板注释。当然也可能什么都不是，就是单纯的<。这个逻辑可以说就是小一号的LL(1)。
+
+上面我们用数字和字符两个case作为例子，描述了QuickJS使用的算法过程，非常简单的LL(1)。下面我们看看这个过程返回的是一个什么样的结构。
+
+#+BEGIN_SRC c
+typedef struct JSToken {
+    int val;
+    int line_num;   /* line number of token start */
+    const uint8_t *ptr;
+    union {
+        struct {
+            JSValue str;
+            int sep;
+        } str;
+        struct {
+            JSValue val;
+        } num;
+        struct {
+            JSAtom atom;
+            BOOL has_escape;
+            BOOL is_reserved;
+        } ident;
+        struct {
+            JSValue body;
+            JSValue flags;
+        } regexp;
+    } u;
+} JSToken;
+#+END_SRC
+
+这个结构最主要的就是一个val和共用体u，val标识现在是什么变量，例如标识符TOK_IDENT、字符串TOK_STRING。u则对应具体的值是什么。
+
+词法分析相关的虽然还有一些函数，例如peek_token,simple_next_token等，都万变不离其宗，这里不在描述。接下来就是重头戏语法分析了。
+
+* 语法分析
+一般的编译书籍都会讲，语法分析阶段都生成一个语法树，之后会多次遍历语法树来生成具体的数据流图或者CFG等。不过QuickJS没有生成语法树，为了压缩编译时间，快速的进行编译，它选择了在语法分析阶段就生成字节码。
+
+#+BEGIN_QUOTE
+lua也是这种做法，解析语法的同时生成字节码。
+#+END_QUOTE
+
+不过js的语法特性还是比较多的，不可能在一节就讲完，我会在之后的几节中持续的说明字节码生成的细节。
+
+QuickJS选择的语法解析仍旧是LL(1)（纳尼？！）。对于手写语法解析器来说，还是递归下降这种方式更符合人的思考习惯。
+
+#+BEGIN_QUOTE
+一般自动生成的语法解析才会选择lr系列算法，例如yacc/bison。不过也有例外，anltr语法生成器是使用的LL(*)算法，对用户其实也更友好。
+#+END_QUOTE
+
+言归正传，QuickJS的语法解析是从。

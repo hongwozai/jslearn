@@ -92,7 +92,7 @@ struct JSGCObjectHeader {
 };
 #+END_SRC
 
-可以看到JSGCObjectHeader同样是具有ref_count。这个类型中的其他字段我们会在垃圾回收篇具体讲解，这里只需要知道有这么一回事就好了。
+可以看到JSGCObjectHeader同样是具有ref_count字段，能够强制转换为JSRefCountHeader。这个类型中的其他字段我们会在垃圾回收篇具体讲解，这里只需要知道有这么一回事就好了。
 
 * 原子
 
