@@ -1,0 +1,196 @@
+#+TITLE: QuickJS源码阅读 动态类型、对象模型与原子
+
+* 动态类型模型
+
+#+BEGIN_SRC javascript
+// a是数字
+qjs> a = 1
+1
+// a是字符串
+qjs> a = "123"
+"123"
+#+END_SRC
+
+看看上面这个代码，不知道同学们对这种动态类型有没有过好奇，为啥一个变量能赋值成不同类型的对象呢？至少对我这种一开始是用C语言做编程启蒙的人来说，感觉是挺奇怪的，那他们是如何实现的呢？
+
+如果想实现这样的一种效果，那a变量的类型就不能像c语言一样是固定的了，而是应该与值放在一起。QuickJS在32位与64位上的实现方式有所不同（大同小异），我们这里只按64位的来进行讲解。在64位的情况下，所有的QuickJS的值都是由下面的结构体来表示的。
+
+#+BEGIN_SRC c
+/* 在没有JS_NAN_BOXING宏的情况下 */
+typedef union JSValueUnion {
+    int32_t int32;
+    double float64;
+    void *ptr;
+} JSValueUnion;
+
+typedef struct JSValue {
+    JSValueUnion u;
+    int64_t tag;
+} JSValue;
+#+END_SRC
+
+这个值类型中的tag就是表示具体的类型，而共用体u就是表示的具体的值的内容。
+
+由于之前我们就说过，QuickJS的垃圾回收策略是引用计数，那引用计数在哪呢？这个结构体中似乎也没有存放引用计数的地方。这个就涉及到QuickJS的虚拟机等表示方式了，可以这么说，QuickJS的虚拟机的每一个栈元素都是一个JSValue。从这个角度去理解就顺理成章了，存放在栈里的对象自然是无需垃圾回收器进行回收，函数调用完毕时栈自然也就废弃了。这点我们之后的章节会详细描述。
+
+为什么JSValue要表示为现在这个形式呢，同为Javascrpit引擎的V8，其值的表现形式就不太一样。V8利用内存对齐时指针后2bit全为0的特性，将最后1bit变成类型字段来区分立即数和指针。这种做法等同于将JSValue的tag和u两个字段合一，真实机器中一个寄存器就可以放的下，效率很高。大致形式如下图：
+
+[[file:obj/v8-ptr.png]]
+
+那为什么JSValue不采用这种形式呢？有着同样设计目标的lua语言作者有一篇论文《The Implementation of Lua5.0》中提到了，为了跨平台，不会采用内存对齐等方式来设计虚拟机。想必QuickJS也是如此权衡。
+
+那么数字的表示就很明显了，就是这样：
+
+[[file:obj/jsvalue_num.png]]
+
+在数字的表示上，QuickJS支持大数计算，但是这不属于本文讲解的重点，所以我们只看QuickJS中基本的整数与浮点数处理流程。当你阅读完本篇，其实大数计算的实现模型也就基本明了（此处指的大数相关对象的实现模型，而非大数计算的具体算法）。
+
+* 引用对象
+
+那堆对象是如何表示的呢？垃圾回收所需要的引用计数又是记录在哪的呢？且看下面的代码。
+
+#+BEGIN_SRC c
+typedef struct JSRefCountHeader {
+    int ref_count;
+} JSRefCountHeader;
+
+struct JSString {
+    JSRefCountHeader header; /* must come first, 32-bit */
+    /* 字符串长度 */
+    uint32_t len : 31;
+    uint8_t is_wide_char : 1; /* 0 = 8 bits, 1 = 16 bits characters */
+    /* <============ 省略成员 =============> */
+    union {
+        uint8_t str8[0]; /* 正常的8bit字符串 */
+        uint16_t str16[0]; /* utf16表示的字符串 */
+    } u;
+};
+#+END_SRC
+
+我这里将列出了字符串对象的实现方式，可以看到JSString首先就是继承了JSRefCountHeader，这里是使用了C语言中一种模拟继承的惯用手法，利用内存位置的一致性，放在开头位置上的成员可以直接通过强制转换获得。
+
+#+BEGIN_SRC c
+JSString str;
+JSRefCountHeader *a = (JSRefCountHeader*)&str;
+#+END_SRC
+
+这里代码很明白，无需多说。之前我们说过，JSValue是所有QuickJS对象的入口，整体的效果如图。
+
+[[file:obj/jsvalue_ref.png]]
+
+因为QuickJS的垃圾回收采用的是引用计数，它有一个致命的缺陷，就是循环引用。为了解决这个问题，QuickJS需要在头部加入更多的字段来针对循环引用进行回收。所以实际上QuickJS将引用类型分成了两类，一类是如String这样的没有子对象的，一类是如jsObject具有子对象、可能产生循环引用的。这也就是JSGCObjectHeader这个头部的由来。
+
+#+BEGIN_SRC c
+struct JSGCObjectHeader {
+    int ref_count; /* must come first, 32-bit */
+    /* 以下成员可以暂时无视 */
+    JSGCObjectTypeEnum gc_obj_type : 4;
+    uint8_t mark : 4; /* used by the GC */
+    uint8_t dummy1; /* not used by the GC */
+    uint16_t dummy2; /* not used by the GC */
+    struct list_head link;
+};
+#+END_SRC
+
+可以看到JSGCObjectHeader同样是具有ref_count。这个类型中的其他字段我们会在垃圾回收篇具体讲解，这里只需要知道有这么一回事就好了。
+
+* 原子
+
+在QuickJS的原子atom并非指的是并发中原子操作，而是指的哪些不可变并且全局唯一的对象。这个类似于C++设计模式中的享元模式。
+
+在我们编写js的时候可能会产生大量相同的字符串。一类是关键字，如if/else/class等语言的语法元素；一类是我们常用的类名对象名等，如JSON/Symbol/Array。用户在写代码的过程中会大量的使用这些，如果每次都重新生成，会产生很多的内存和性能的消耗，所以QuickJS会在生成这些对象之后复用这些对象。
+
+需要指出的是，这里其实是QuickJS或者说是各种语言里常见的优化方式，即使不了解如何实现，也不会影响你阅读之后的源码/内容。
+
+接下来，我们看看QuickJS中如何实现atom结构。
+
+#+BEGIN_SRC c
+  struct JSRuntime {
+      /* <============ 省略无关对象 =============> */
+      int atom_hash_size; /* power of two */
+      int atom_count;
+      int atom_size;
+      int atom_count_resize; /* resize hash table at this count */
+      uint32_t *atom_hash;
+      JSAtomStruct **atom_array;
+      int atom_free_index; /* 0 = none */
+      /* <========= 省略无关对象 =============> */
+  };
+
+  /* JSString在上节介绍过 */
+  typedef struct JSString JSAtomStruct;
+
+  /* atom类型相当于索引 */
+  typedef uint32_t JSAtom;
+#+END_SRC
+
+这里有些令人迷惑的地方，这个atom_hash和atom_array究竟是什么，看样子并不像一个hash表的实现。实际上，QuickJS的这个atom实现，逻辑上的结构就是一个标准的hash表，只是这里将每个hash节点用索引进行标识，而每一个atom_hash或者JSString的hash_next字段都是代表当前hash链表的下一个节点的索引。
+
+下面就是JSString全部的结构体成员，其中的hash_next被用来做下一个节点的指针。这里其实是QuickJS复用了JSString这个结构体，本质上来讲，原子表的hash节点与JSString没有必然的联系。用户创建的字符串不一定是在原子表中，字段atom_type=0时就代表此种情况。
+
+#+BEGIN_SRC c
+struct JSString {
+    JSRefCountHeader header; /* must come first, 32-bit */
+    uint32_t len : 31;
+    uint8_t is_wide_char : 1; /* 0 = 8 bits, 1 = 16 bits characters */
+    /* 以下三个字段是代表当前string是否在原子表中 */
+    uint32_t hash : 30;
+    uint8_t atom_type : 2; /* 该项非0则代表该字符串已经存在原子表中 */
+    uint32_t hash_next; /* 代表表中的下一个hash节点 */
+
+    union {
+        uint8_t str8[0]; /* 8 bit strings will get an extra null terminator */
+        uint16_t str16[0];
+    } u;
+};
+#+END_SRC
+
+下图描述了原子表的结构，为了更好的说明，这里用把逻辑上的关系用虚线箭头连接起来。
+
+[[file:obj/jsvalue_atom.png]]
+
+鉴于篇幅，这里不在详细讲述所有atom操作的具体实现，仅描述从hash表中查找的操作列出。
+
+#+BEGIN_SRC c
+  static JSAtom __JS_FindAtom(JSRuntime *rt, const char *str, size_t len,
+                              int atom_type)
+  {
+      uint32_t h, h1, i;
+      JSAtomStruct *p;
+
+      /* 计算hash值 */
+      h = hash_string8((const uint8_t *)str, len, JS_ATOM_TYPE_STRING);
+
+      /* 求模，取得真正的hash链表 */
+      h &= JS_ATOM_HASH_MASK;
+      h1 = h & (rt->atom_hash_size - 1);
+
+      /* 这里索引i指向hash链表的第一个节点 */
+      i = rt->atom_hash[h1];
+      while (i != 0) {
+          /* 取出当前hash节点 */
+          p = rt->atom_array[i];
+
+          /* 比较是否相同 */
+          if (p->hash == h &&
+              p->atom_type == JS_ATOM_TYPE_STRING &&
+              p->len == len &&
+              p->is_wide_char == 0 &&
+              memcmp(p->u.str8, str, len) == 0) {
+              /* 如果是用户定义的原子，取出时需要将引用计数+1 */
+              if (!__JS_AtomIsConst(i))
+                  p->header.ref_count++;
+              /* 将这个字符串对象的索引返回出去 */
+              return i;
+          }
+          /* 找下一个hash节点 */
+          i = p->hash_next;
+      }
+      return JS_ATOM_NULL;
+  }
+#+END_SRC
+
+可以看到，根据字符串内容查找atom的过程就是简单的hash表查找操作。当查找到对应的节点时，就返回该字符串的索引。之后这个索引就相当于字符串本身，可以随时通过rt->atom_array[index]的方式取出。
+
+有的同学可能会对__JS_AtomIsConst函数比较好奇，这个函数其实是判断该字符串是否是开发者定义好的。对于像if/else这些开发者设定好的字符串，这里是不会将其纳入引用计数的管理中的，因为这些字段永远也不会释放。而用户自己定义的atom需要在取出时将其引用计数+1。开发者定义的字符串或符号会定义到quickjs-atom.h文件中。
+
