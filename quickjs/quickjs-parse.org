@@ -124,7 +124,7 @@ QuickJS词法分析几乎全部流程都在next_token函数中。下面我们来
 
 上面的代码也很简单，走到了<的case中也要判断下一个字符是什么，是=还是<，又或是html的模板注释。当然也可能什么都不是，就是单纯的<。这个逻辑可以说就是小一号的LL(1)。
 
-上面我们用数字和字符两个case作为例子，描述了QuickJS使用的算法过程，非常简单的LL(1)。下面我们看看这个过程返回的是一个什么样的结构。
+上面我们用数字和字符两个case作为例子，描述了QuickJS使用的LL(1)算法过程。下面我们看看这个过程返回的是一个什么样的结构。
 
 #+BEGIN_SRC c
 typedef struct JSToken {
@@ -152,7 +152,7 @@ typedef struct JSToken {
 } JSToken;
 #+END_SRC
 
-这个结构最主要的就是一个val和共用体u，val标识现在是什么变量，例如标识符TOK_IDENT、字符串TOK_STRING。u则对应具体的值是什么。
+这个结构最主要的就是一个val和共用体u，val标识现在是什么变量，例如标识符TOK_IDENT、字符串TOK_STRING。u则对应具体的值是什么。next_token就是每次返回这样一个结构给语法分析器。
 
 词法分析相关的虽然还有一些函数，例如peek_token,simple_next_token等，都万变不离其宗，这里不在描述。接下来就是重头戏语法分析了。
 
